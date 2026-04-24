@@ -28,11 +28,120 @@ import argparse
 import json
 import re
 import hashlib
+import uuid
 import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Set
 from dataclasses import dataclass, asdict
+
+# ──────────────────────────────────────────────────────────
+# 段落级内容质量过滤器
+# ──────────────────────────────────────────────────────────
+
+_AD_PATTERN = re.compile(
+    r'www\.\S+|http[s]?://\S+'
+    r'|(?:免费|全文|txt|epub|mobi).{0,6}(?:下载|书库|阅读站|小说网)'
+    r'|本书来自\S+'
+    r'|(?:手机版|移动版)\s*(?:访问|阅读)'
+    r'|书友群|QQ群|微信群|公众号'
+    r'|推荐票|月票|打赏|(?:求|送)\s*(?:票|赞)',
+    re.IGNORECASE,
+)
+
+_CHAPTER_LINE_PATTERN = re.compile(
+    r'^第[一二三四五六七八九十百千万零\d]+[章节卷部回集]\s*'
+)
+
+_SENTENCE_ENDERS = frozenset('。！？…"』」》）】')
+
+_FORBIDDEN_PHRASES = [
+    "总之", "综上所述", "不得不说", "让人不禁",
+    "作为一个", "值得一提的是", "不得不承认", "毋庸置疑",
+    "众所周知", "诚然", "固然", "首先，其次，",
+    "叮！恭喜宿主", "系统提示：", "【叮！】", "恭喜获得",
+    "经验值+", "技能书×", "属性面板",
+    "攻击力：", "防御力：", "品质：稀有", "品质：传说",
+]
+
+
+def _is_ad_paragraph(para: str) -> bool:
+    """检测广告/下载站段落。返回 True 表示应过滤。"""
+    return bool(_AD_PATTERN.search(para))
+
+
+def _is_catalog_page(para: str) -> bool:
+    """检测目录页：>= 3 行且 >= 40% 行符合章节标题格式。"""
+    lines = [l.strip() for l in para.split('\n') if l.strip()]
+    if len(lines) < 3:
+        return False
+    chapter_lines = sum(1 for l in lines if _CHAPTER_LINE_PATTERN.match(l))
+    return chapter_lines / len(lines) >= 0.4
+
+
+def _get_chinese_ratio(text: str) -> float:
+    """汉字占总字符数的比例。"""
+    if not text:
+        return 0.0
+    chinese = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    return chinese / len(text)
+
+
+def _is_sentence_complete(para: str) -> bool:
+    """段落末尾是否为合法句末符号。"""
+    stripped = para.rstrip()
+    return bool(stripped) and stripped[-1] in _SENTENCE_ENDERS
+
+
+def _info_density(text: str) -> float:
+    """信息密度 = 唯一字符数 / 非空白字符总数。"""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0
+    return len(set(chars)) / len(chars)
+
+
+# C4 风格行级过滤标志
+_LINE_BAD_SUBSTRINGS = (
+    "javascript", "cookie policy", "terms of use", "lorem ipsum",
+    "用户协议", "隐私政策", "免责声明", "版权所有", "all rights reserved",
+    "请扫描", "关注我们", "长按识别",
+)
+
+
+def _clean_lines(paragraph: str) -> str:
+    """C4 风格行级清洗：逐行判定，丢弃广告/声明行后重新拼接。"""
+    good_lines = []
+    for line in paragraph.split('\n'):
+        stripped = line.strip()
+        if len(stripped) < 2:
+            continue
+        low = stripped.lower()
+        if any(bad in low for bad in _LINE_BAD_SUBSTRINGS):
+            continue
+        if _AD_PATTERN.search(stripped):
+            continue
+        good_lines.append(stripped)
+    return '\n'.join(good_lines)
+
+
+import math as _math
+from collections import Counter as _Counter
+
+
+def _bigram_entropy(text: str) -> float:
+    """计算 bigram Shannon 熵。正常汉语小说 bigram 熵 > 7.0；模板化/重复文本 < 5.0。"""
+    chars = [c for c in text if not c.isspace()]
+    if len(chars) < 20:
+        return 0.0
+    bigrams = [chars[i] + chars[i+1] for i in range(len(chars) - 1)]
+    counter = _Counter(bigrams)
+    total = sum(counter.values())
+    return -sum(
+        (count / total) * _math.log2(count / total)
+        for count in counter.values()
+    )
+
 
 # 获取项目根目录
 _project_root = Path(__file__).resolve().parent.parent
@@ -453,8 +562,9 @@ class CaseBuilder:
             self.novel_sources = get_novel_sources()
         else:
             # 回退到旧方式
+            import os
             self.config = config or {}
-            self.qdrant_url = self.config.get("qdrant_url", "http://localhost:6333")
+            self.qdrant_url = self.config.get("qdrant_url", os.environ.get("QDRANT_URL", "http://localhost:6333"))
             self.collection_name = self.config.get("collections", {}).get(
                 "case_library", "case_library_v2"
             )
@@ -814,16 +924,27 @@ python case_builder.py --sync
         return "玄幻奇幻"  # 默认
 
     def _split_paragraphs(self, content: str) -> List[str]:
-        """分割段落"""
-        # 按空行分割
+        """分割段落，并过滤广告/目录/低质量内容。"""
         paragraphs = re.split(r"\n\s*\n", content)
 
-        # 过滤太短或太长的
         filtered = []
         for p in paragraphs:
             p = p.strip()
-            if 100 <= len(p) <= 5000:
-                filtered.append(p)
+            # C4 风格行级清洗（先清理段内坏行）
+            p = _clean_lines(p)
+            # 长度门槛（清洗后再检查）
+            if not (100 <= len(p) <= 5000):
+                continue
+            # 广告/下载站
+            if _is_ad_paragraph(p):
+                continue
+            # 目录页
+            if _is_catalog_page(p):
+                continue
+            # 汉字比例不足
+            if _get_chinese_ratio(p) < 0.6:
+                continue
+            filtered.append(p)
 
         return filtered
 
@@ -893,28 +1014,46 @@ python case_builder.py --sync
         return cases
 
     def _calculate_quality(self, content: str, match_count: int) -> float:
-        """计算质量分"""
+        """计算质量分（扩展版：禁用词 + 信息密度 + 句末完整性）"""
         score = 6.0  # 基础分
 
-        # 关键词匹配加分
+        # 关键词匹配加分（上限 1.5）
         score += min(match_count * 0.3, 1.5)
 
         # 长度适中加分
         if 500 <= len(content) <= 2000:
             score += 0.5
 
-        # 检查禁止项（AI味等）
-        forbidden = ["总之", "综上所述", "不得不说", "让人不禁"]
-        for f in forbidden:
-            if f in content:
+        # 禁用词（扩展版）
+        for phrase in _FORBIDDEN_PHRASES:
+            if phrase in content:
                 score -= 0.5
 
-        # 检查对话密度
-        quote_count = content.count('"') + content.count('"')
+        # 对话密度加分
+        quote_count = content.count('\u201c') + content.count('\u201d')
         if quote_count >= 4:
             score += 0.3
 
-        return min(max(score, 0), 10)  # 限制在0-10
+        # 信息密度奖励
+        density = _info_density(content)
+        if density > 0.4:
+            score += 0.3
+        elif density < 0.15:
+            score -= 1.0
+
+        # 句末完整性
+        if not _is_sentence_complete(content):
+            score -= 0.5
+
+        # Bigram 熵（<5.0 视为模板化文本，扣 1.5）
+        if len(content) > 100:
+            entropy = _bigram_entropy(content)
+            if entropy < 5.0:
+                score -= 1.5
+            elif entropy > 8.0:
+                score += 0.3
+
+        return min(max(score, 0), 10)
 
     def _generate_case_id(self, content: str) -> str:
         """生成案例ID"""
@@ -1045,7 +1184,7 @@ python case_builder.py --sync
             points = []
             for j, case in enumerate(batch):
                 point = PointStruct(
-                    id=int(hash(case.get("case_id", f"case_{i + j}")) % (2**31)),
+                        id=str(uuid.uuid5(uuid.NAMESPACE_DNS, case.get("case_id", f"case_{i+j}"))),
                     vector={
                         "dense": out["dense_vecs"][j].tolist(),
                         "sparse": {
